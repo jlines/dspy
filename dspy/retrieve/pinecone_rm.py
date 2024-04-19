@@ -29,9 +29,15 @@ except Exception:
 
 try:
     import openai.error
-    ERRORS = (openai.error.RateLimitError, openai.error.ServiceUnavailableError, openai.error.APIError)
+
+    ERRORS = (
+        openai.error.RateLimitError,
+        openai.error.ServiceUnavailableError,
+        openai.error.APIError,
+    )
 except Exception:
     ERRORS = (openai.RateLimitError, openai.APIError)
+
 
 class PineconeRM(dspy.Retrieve):
     """
@@ -84,16 +90,18 @@ class PineconeRM(dspy.Retrieve):
                 from transformers import AutoModel, AutoTokenizer
             except ImportError as exc:
                 raise ModuleNotFoundError(
-                "You need to install Hugging Face transformers library to use a local embedding model with PineconeRM.",
-            ) from exc
+                    "You need to install Hugging Face transformers library to use a local embedding model with PineconeRM.",
+                ) from exc
 
             self._local_embed_model = AutoModel.from_pretrained(local_embed_model)
             self._local_tokenizer = AutoTokenizer.from_pretrained(local_embed_model)
             self.use_local_model = True
             self.device = torch.device(
-                'cuda:0' if torch.cuda.is_available() else
-                'mps' if torch.backends.mps.is_available()
-                else 'cpu',
+                (
+                    "cuda:0"
+                    if torch.cuda.is_available()
+                    else "mps" if torch.backends.mps.is_available() else "cpu"
+                ),
             )
         elif openai_embed_model is not None:
             self._openai_embed_model = openai_embed_model
@@ -109,7 +117,9 @@ class PineconeRM(dspy.Retrieve):
             )
 
         self._pinecone_index = self._init_pinecone(
-            pinecone_index_name, pinecone_api_key, pinecone_env,
+            pinecone_index_name,
+            pinecone_api_key,
+            pinecone_env,
         )
 
         super().__init__(k=k)
@@ -158,12 +168,12 @@ class PineconeRM(dspy.Retrieve):
             )
 
         return pinecone.Index(index_name)
-    
+
     def _mean_pooling(
-            self, 
-            model_output, 
-            attention_mask,
-        ):
+        self,
+        model_output,
+        attention_mask,
+    ):
         try:
             import torch
         except ImportError as exc:
@@ -171,17 +181,23 @@ class PineconeRM(dspy.Retrieve):
                 "You need to install torch to use a local embedding model with PineconeRM.",
             ) from exc
 
-        token_embeddings = model_output[0] # First element of model_output contains all token embeddings
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
- 
+        token_embeddings = model_output[
+            0
+        ]  # First element of model_output contains all token embeddings
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        )
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(
+            input_mask_expanded.sum(1), min=1e-9
+        )
+
     @backoff.on_exception(
         backoff.expo,
         ERRORS,
         max_time=15,
     )
     def _get_embeddings(
-        self, 
+        self,
         queries: List[str],
     ) -> List[List[float]]:
         """Return query vector after creating embedding using OpenAI
@@ -198,31 +214,37 @@ class PineconeRM(dspy.Retrieve):
             raise ModuleNotFoundError(
                 "You need to install torch to use a local embedding model with PineconeRM.",
             ) from exc
-        
+
         if not self.use_local_model:
             if OPENAI_LEGACY:
                 embedding = openai.Embedding.create(
-                    input=queries, model=self._openai_embed_model,
+                    input=queries,
+                    model=self._openai_embed_model,
                 )
             else:
                 embedding = openai.embeddings.create(
-                    input=queries, model=self._openai_embed_model,
+                    input=queries,
+                    model=self._openai_embed_model,
                 ).model_dump()
             return [embedding["embedding"] for embedding in embedding["data"]]
-        
+
         # Use local model
-        encoded_input = self._local_tokenizer(queries, padding=True, truncation=True, return_tensors="pt").to(self.device)
+        encoded_input = self._local_tokenizer(
+            queries, padding=True, truncation=True, return_tensors="pt"
+        ).to(self.device)
         with torch.no_grad():
             model_output = self._local_embed_model(**encoded_input.to(self.device))
 
-        embeddings = self._mean_pooling(model_output, encoded_input['attention_mask'])
+        embeddings = self._mean_pooling(model_output, encoded_input["attention_mask"])
         normalized_embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return normalized_embeddings.cpu().numpy().tolist()
 
         # we need a pooling strategy to get a single vector representation of the input
         # so the default is to take the mean of the hidden states
 
-    def forward(self, query_or_queries: Union[str, List[str]]) -> dspy.Prediction:
+    def forward(
+        self, query_or_queries: Union[str, List[str]], k: Optional[int] = None, **kwargs
+    ) -> dspy.Prediction:
         """Search with pinecone for self.k top passages for query
 
         Args:
@@ -242,23 +264,29 @@ class PineconeRM(dspy.Retrieve):
         # For single query, just look up the top k passages
         if len(queries) == 1:
             results_dict = self._pinecone_index.query(
-                embeddings[0], top_k=self.k, include_metadata=True,
+                embeddings[0],
+                top_k=self.k,
+                include_metadata=True,
             )
 
             # Sort results by score
             sorted_results = sorted(
-                results_dict["matches"], key=lambda x: x.get("scores", 0.0), reverse=True,
+                results_dict["matches"],
+                key=lambda x: x.get("scores", 0.0),
+                reverse=True,
             )
             passages = [result["metadata"]["text"] for result in sorted_results]
-            passages = [dotdict({"long_text": passage for passage in passages})]
-            return dspy.Prediction(passages=passages)
+            passages = [dotdict({"long_text": passage}) for passage in passages]
+            return passages
 
         # For multiple queries, query each and return the highest scoring passages
         # If a passage is returned multiple times, the score is accumulated. For this reason we increase top_k by 3x
         passage_scores = {}
         for embedding in embeddings:
             results_dict = self._pinecone_index.query(
-                embedding, top_k=self.k * 3, include_metadata=True,
+                embedding,
+                top_k=self.k * 3,
+                include_metadata=True,
             )
             for result in results_dict["matches"]:
                 passage_scores[result["metadata"]["text"]] = (
@@ -267,6 +295,10 @@ class PineconeRM(dspy.Retrieve):
                 )
 
         sorted_passages = sorted(
-            passage_scores.items(), key=lambda x: x[1], reverse=True,
+            passage_scores.items(),
+            key=lambda x: x[1],
+            reverse=True,
         )[: self.k]
-        return dspy.Prediction(passages=[dotdict({"long_text": passage}) for passage, _ in sorted_passages])
+        return dspy.Prediction(
+            passages=[dotdict({"long_text": passage}) for passage, _ in sorted_passages]
+        )
